@@ -1,0 +1,187 @@
+stages:
+  - pre-build
+  - test
+  - build
+  - publish
+  - scanning
+  - deploy
+  - performance
+
+default:
+  tags:
+    - docker
+
+variables:
+  DEFAULT_MAVEN_CLI_OPTS: "--show-version -Dmaven.repo.local=$CI_PROJECT_DIR/.m2/repository"
+  MAVEN_JDK_VERSION: "3.8.5-openjdk-17"
+  DOCKER_VERSION: "stable"
+  DOCKER_DIND_VERSION: "18.09-dind"
+  KUBECTL_VERSION: 1.23.15-alpine
+
+get-fact-project-info:
+  image: private.nexus-registry.docker.local:8086/maven:${MAVEN_JDK_VERSION}
+  only:
+    - /-release/
+  cache:
+    paths:
+      - .m2/repository
+  stage: pre-build
+  script:
+    - mvn -s $M2_SETTINGS_XML $DEFAULT_MAVEN_CLI_OPTS versions:set -DnewVersion=$CI_COMMIT_REF_SLUG
+    - MVN_BUILD_FILE_NAME=$(mvn -s $M2_SETTINGS_XML -N -q -DforceStdout help:evaluate -Dexpression="project.build.finalName").jar
+    - MVN_PROJECT_NAME=$(mvn -s $M2_SETTINGS_XML -N -q -DforceStdout help:evaluate -Dexpression="project.artifactId")
+    - MVN_PROJECT_GROUP_ID=$(mvn -s $M2_SETTINGS_XML -N -q -DforceStdout help:evaluate -Dexpression="project.groupId")
+    - echo "JAR_FILE=$MVN_BUILD_FILE_NAME" >> deploy.env
+    - echo "PROJECT_NAME=${MVN_PROJECT_NAME}" >> deploy.env
+    - echo "PROJECT_GROUP_ID=${MVN_PROJECT_GROUP_ID}" >> deploy.env
+    - echo "CI_PARENT_PROJECT_NAME=${MVN_PROJECT_NAME}" >> deploy.env
+    - echo "CI_PARENT_PROJECT_GROUP_ID=${MVN_PROJECT_GROUP_ID}" >> deploy.env
+    - echo "CI_PARENT_COMMIT_TAG=${CI_COMMIT_TAG}" >> deploy.env
+    - echo "CI_PARENT_COMMIT_SHORT_SHA=${CI_COMMIT_SHORT_SHA}" >> deploy.env
+    - echo "CI_PARENT_PIPELINE_PROJECT_ID=${CI_PROJECT_ID}" >> deploy.env
+  artifacts:
+    paths:
+      - deploy.env
+    reports:
+      dotenv: deploy.env
+
+test-junit:
+  stage: test
+  only:
+    - /-release/
+  allow_failure: true
+  image: private.nexus-registry.docker.local:8086/maven:${MAVEN_JDK_VERSION}
+  cache:
+    paths:
+      - .m2/repository
+  before_script:
+    - mvn -s $M2_SETTINGS_XML $DEFAULT_MAVEN_CLI_OPTS versions:set -DnewVersion=$CI_COMMIT_REF_SLUG
+  script:
+    - mvn -s $M2_SETTINGS_XML $DEFAULT_MAVEN_CLI_OPTS test jacoco:prepare-agent jacoco:report
+  artifacts:
+    paths:
+      - target/site/jacoco
+    reports:
+      junit:
+        - target/surefire-reports/TEST-*.xml
+        - target/failsafe-reports/TEST-*.xml
+
+build-jar:
+  stage: build
+  only:
+    - /-release/
+  image: private.nexus-registry.docker.local:8086/maven:${MAVEN_JDK_VERSION}
+  cache:
+    paths:
+      - .m2/repository
+  needs:
+    - get-fact-project-info
+    - test-junit
+  before_script:
+    - mvn -s $M2_SETTINGS_XML $DEFAULT_MAVEN_CLI_OPTS versions:set -DnewVersion=$CI_COMMIT_REF_SLUG
+  script:
+    - mvn -s $M2_SETTINGS_XML $DEFAULT_MAVEN_CLI_OPTS package -DskipTests
+  artifacts:
+    paths:
+      - target/*.jar
+    name: $CI_JOB_NAME-$CI_PROJECT_NAME-$CI_COMMIT_REF_SLUG
+
+build-docker:
+  stage: publish
+  only:
+    - /-release/
+  image: private.nexus-registry.docker.local:8086/docker:${DOCKER_VERSION}
+  needs:
+    - get-fact-project-info
+    - build-jar
+  variables:
+    DOCKER_HOST: unix:///var/run/docker.sock
+    DOCKER_DRIVER: overlay2
+    DOCKER_TLS_CERTDIR: ""
+    DOCKER_BUILD_ARGS_ENTRIPOINT: "--build-arg JAR_FILE=$JAR_FILE"
+    DOCKERFILE_LOCATION: "-f Dockerfile"
+    DOCKER_TAGS:
+      private.nexus-registry.docker.local:8087/$PROJECT_GROUP_ID/$PROJECT_NAME
+    DOCKER_CONTEXT_PATH: "."
+  before_script:
+    - mkdir -p .docker/ && cat $DOCKER_CONF_JSON > .docker/config.json
+  script:
+    - docker build -q $DOCKERFILE_LOCATION $DOCKER_BUILD_ARGS_ENTRIPOINT -t $PROJECT_GROUP_ID/$PROJECT_NAME:latest $DOCKER_CONTEXT_PATH
+    - >
+      for TAG in ${DOCKER_TAGS};
+      do
+          echo "--------------------------------";
+          echo "docker image tag $TAG";
+          docker image tag $PROJECT_GROUP_ID/$PROJECT_NAME:latest $TAG:$CI_COMMIT_REF_SLUG
+          docker image tag $PROJECT_GROUP_ID/$PROJECT_NAME:latest $TAG:$CI_COMMIT_SHORT_SHA
+          echo "--------------------------------";
+          echo "docker image push $TAG";
+          docker --config .docker image push $TAG:$CI_COMMIT_REF_SLUG
+          docker --config .docker image push $TAG:$CI_COMMIT_SHORT_SHA
+          echo "--------------------------------";
+      done
+  after_script:
+    - echo "CI_REGISTRY_IMAGE_NAME=$PROJECT_GROUP_ID/$PROJECT_NAME" >> deploy.env
+    - echo "CI_REGISTRY_IMAGE_VERSION=$CI_COMMIT_SHORT_SHA" >> deploy.env
+    - echo "CI_REGISTRY_IMAGE=private.nexus-registry.docker.local:8087/$PROJECT_GROUP_ID/$PROJECT_NAME" >> deploy.env
+  artifacts:
+    name: $CI_JOB_NAME-$CI_PROJECT_NAME-$CI_COMMIT_REF_SLUG
+    reports:
+      dotenv: deploy.env
+
+deploy-k8s-review:
+  stage: deploy
+  only:
+    - /-release/
+  needs:
+    - build-docker
+  variables:
+    DIR_BUILD: application
+    GIT_REMOTE_BRANCH: k8s-review
+    KUBERNETES_MANIFEST_TEMPLATES:
+      src/kubernetes/overlays/ci
+    PUSH_OPTIONS: --force
+    PULL_OPTIONS: --force
+    COMMIT_OPTIONS: --allow-empty
+    COMMIT_MESSAGE: "build project ${CI_COMMIT_SHORT_SHA} on branch ${CI_COMMIT_BRANCH} at ${CI_COMMIT_TIMESTAMP}"
+    GIT_LOCAL_BRANCH: main
+    GIT_REMOTE_REPO: "$CI_SERVER_PROTOCOL://${GIT_ACCESS_TOKEN}:${GIT_ACCESS_TOKEN}@$CI_SERVER_HOST:$CI_SERVER_PORT/$CI_PROJECT_PATH.git"
+  environment:
+    name: review/$CI_COMMIT_REF_SLUG
+    url: http://10.12.1.202:30001
+  image:
+    name: private.nexus-registry.docker.local:8086/dimmaryanto93/k8s-kubectl-helm:${KUBECTL_VERSION}
+    entrypoint: ['']
+  resource_group: deploy/review
+  artifacts:
+    name: ${CI_JOB_NAME_SLUG}
+    paths:
+      - $DIR_BUILD/*
+      - environment_url.txt
+  after_script:
+    - echo $CI_ENVIRONMENT_URL > environment_url.txt
+  script:
+    - mkdir -p $DIR_BUILD
+    - >
+      for TEMPLATE in ${KUBERNETES_MANIFEST_TEMPLATES};
+      do
+          echo "--------------------------------";
+          echo "kubernetes manifest => $TEMPLATE";
+          kubectl kustomize $TEMPLATE | envsubst > $DIR_BUILD/$CI_JOB_NAME_SLUG.yaml
+          echo ">>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>";
+      done
+    - mkdir -p source && cd source
+    - git init -b $GIT_LOCAL_BRANCH
+    - git remote add local $GIT_REMOTE_REPO
+    - git config --global user.email "bot-gitlab-ci@$CI_SERVER_HOST"
+    - git config --global user.name "bot-gitlab-ci"
+    - export GIT_EXISTING_REMOTE_BRANCH=$(git ls-remote local --refs heads/$GIT_REMOTE_BRANCH | wc -l);
+    - |
+      if [ ${GIT_EXISTING_REMOTE_BRANCH} -eq 1 ]; 
+        then git pull $PULL_OPTIONS local $GIT_REMOTE_BRANCH:$GIT_LOCAL_BRANCH;
+        else echo "Branch: $GIT_REMOTE_BRANCH is not available!";
+      fi
+    - cp -R ../$DIR_BUILD/* .
+    - git add .
+    - git commit $COMMIT_OPTIONS -m "${COMMIT_MESSAGE}"
+    - git push $PUSH_OPTIONS $GIT_REMOTE_REPO $GIT_LOCAL_BRANCH:$GIT_REMOTE_BRANCH
